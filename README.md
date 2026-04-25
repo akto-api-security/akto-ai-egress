@@ -2,4 +2,5 @@ Run the following -
 
 ```export ANTHROPIC_API_KEY=sk-ant-....
 export AKTO_GUARDRAILS_URL=...
-docker compose up --build```
+docker compose up --build
+```
