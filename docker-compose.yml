@@ -5,12 +5,9 @@ services:
       dockerfile: Dockerfile
     image: akto-egress-proxy
     container_name: akto-egress-proxy
-
-
-#    command: >
-#     sh -c "pip install requests &&
-#          mitmdump --listen-host 0.0.0.0 --listen-port 8087 -s /addons/akto_guardrails.py" 
     command: mitmdump --listen-host 0.0.0.0 --listen-port 8087  -s /addons/akto_guardrails.py
+    environment:
+      AKTO_URL: ${AKTO_URL}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
       - ./akto-egress-proxy:/addons:ro
