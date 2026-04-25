@@ -1,0 +1,35 @@
+services:
+  akto-egress-proxy:
+    build:
+      context: ./akto-egress-proxy
+      dockerfile: Dockerfile
+    image: akto-egress-proxy
+    container_name: akto-egress-proxy
+
+
+#    command: >
+#     sh -c "pip install requests &&
+#          mitmdump --listen-host 0.0.0.0 --listen-port 8087 -s /addons/akto_guardrails.py" 
+    command: mitmdump --listen-host 0.0.0.0 --listen-port 8087  -s /addons/akto_guardrails.py
+    volumes:
+      - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
+      - ./akto-egress-proxy:/addons:ro
+    expose:
+      - "8087"
+
+  anthropic-agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    image: anthropic-agent
+    container_name: anthropic-agent
+    depends_on:
+      - akto-egress-proxy
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      HTTP_PROXY: http://akto-egress-proxy:8087
+      HTTPS_PROXY: http://akto-egress-proxy:8087
+      SSL_CERT_FILE: /certs/mitmproxy-ca-cert.pem
+      REQUESTS_CA_BUNDLE: /certs/mitmproxy-ca-cert.pem
+    volumes:
+      - ./mitmproxy-data/mitmproxy-ca-cert.pem:/certs/mitmproxy-ca-cert.pem:ro
