@@ -3,13 +3,17 @@ import time
 import requests
 from mitmproxy import http
 
-AKTO_URL = "https://1726615470-guardrails.akto.io/api/http-proxy"
+import os
+
+AKTO_URL = os.getenv("AKTO_URL")
+AKTO_ENABLED = bool(AKTO_URL)
 
 AI_HOSTS = {
     "api.openai.com",
     "api.anthropic.com",
 }
 
+print(f"[AKTO] URL: {AKTO_URL}")
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return flow.request.pretty_host in AI_HOSTS
