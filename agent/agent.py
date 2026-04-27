@@ -62,6 +62,6 @@ for prompt in [
     try:
         print(run_agent(prompt))
     except Exception as e:
-        print(f"[ERROR] {prompt!r}: {e}")
+        print(f"[ERROR] {prompt}: {e}")
 
 
