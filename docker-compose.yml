@@ -8,6 +8,7 @@ services:
     command: mitmdump --listen-host 0.0.0.0 --listen-port 8087  -s /addons/akto_guardrails.py
     environment:
       AKTO_URL: ${AKTO_URL}
+      APP_NAME: ${APP_NAME:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
       - ./akto-egress-proxy:/addons:ro
