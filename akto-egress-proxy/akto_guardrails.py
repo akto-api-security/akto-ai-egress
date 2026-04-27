@@ -5,8 +5,9 @@ from mitmproxy import http
 
 import os
 
-AKTO_URL = os.getenv("AKTO_URL")
+AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
 AKTO_ENABLED = bool(AKTO_URL)
+APP_NAME = os.getenv("APP_NAME")
 
 AI_HOSTS = {
     "api.openai.com",
@@ -23,8 +24,13 @@ def safe_headers(headers) -> str:
     return json.dumps(dict(headers))
 
 def minimal_headers(headers) -> str:
+    result = {}
     ct = headers.get("content-type", "")
-    return json.dumps({"content-type": ct}) if ct else "{}"
+    if ct:
+        result["content-type"] = ct
+    if APP_NAME:
+        result["host"] = APP_NAME
+    return json.dumps(result) if result else "{}"
 
 def extract_messages(flow: http.HTTPFlow) -> str:
     try:
@@ -79,7 +85,7 @@ def call_akto_request(flow: http.HTTPFlow) -> dict:
     print ("evaluating request: ")
     r = requests.get(
         AKTO_URL,
-        params={"guardrails": "true"},
+        params={"guardrails": "true", "ingest_data": "true"},
         headers={"Content-Type": "application/json"},
         json=build_akto_payload(flow),
         timeout=15,
@@ -92,7 +98,7 @@ def call_akto_response(flow: http.HTTPFlow) -> dict:
     print("evaluating response: ")
     r = requests.get(
         AKTO_URL,
-        params={"response_guardrails": "true"},
+        params={"response_guardrails": "true", "ingest_data": "true"},
         headers={"Content-Type": "application/json"},
         json=build_akto_payload(
             flow,
