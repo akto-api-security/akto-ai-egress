@@ -5,7 +5,17 @@ services:
       dockerfile: Dockerfile
     image: akto-egress-proxy
     container_name: akto-egress-proxy
-    command: mitmdump --listen-host 0.0.0.0 --listen-port 8087  -s /addons/akto_guardrails.py
+    command:
+    - mitmdump
+    - --listen-host
+    - 0.0.0.0
+    - --listen-port
+    - "8087"
+    - --ignore-hosts
+    - ^(?!.*((^|\.)anthropic\.com$$|(^|\.)openai\.com$$|(^|\.)chatgpt\.com$$|(^|\.)amazonaws\.com$$)).*$$
+    - -s
+    - /addons/akto_guardrails.py
+
     environment:
       AKTO_URL: ${AKTO_URL}
       APP_NAME: ${APP_NAME:-}
@@ -27,7 +37,5 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       HTTP_PROXY: http://akto-egress-proxy:8087
       HTTPS_PROXY: http://akto-egress-proxy:8087
-      SSL_CERT_FILE: /certs/mitmproxy-ca-cert.pem
-      REQUESTS_CA_BUNDLE: /certs/mitmproxy-ca-cert.pem
     volumes:
-      - ./mitmproxy-data/mitmproxy-ca-cert.pem:/certs/mitmproxy-ca-cert.pem:ro
+      - ./mitmproxy-data/mitmproxy-ca-cert.pem:/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt:ro
