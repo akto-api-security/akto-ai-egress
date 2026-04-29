@@ -1,16 +1,14 @@
 FROM python:3.10-slim
 
-WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-# Install system certs
-RUN apt-get update && apt-get install -y ca-certificates && update-ca-certificates
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent.py .
+COPY . .
 
-# Environment defaults (can override at runtime)
-ENV PYTHONUNBUFFERED=1
-
-CMD ["python", "agent.py"]
+CMD update-ca-certificates && python /app/agent.py
