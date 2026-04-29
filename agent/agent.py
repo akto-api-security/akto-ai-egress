@@ -1,5 +1,6 @@
 import os
 import anthropic
+import requests
 
 client = anthropic.Anthropic()
 
@@ -53,6 +54,24 @@ def run_agent(user_text: str):
             )
 
         messages.append({"role": "user", "content": tool_results})
+
+url = "https://bedrock-runtime.ap-south-1.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/invoke"
+
+payload = {
+	"anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 50,
+        "messages": [
+            {"role": "user", "content": "Hello!"}
+        ]
+    }
+
+# not supposed to succeed. 
+# Expected : should give "Missing auth" error. 
+# Expected : shoult NOT give certificate error
+response = requests.post(url, json=payload)
+print(response.json())
+
+
 
 for prompt in [
     "What time is it? Use the tool.",
