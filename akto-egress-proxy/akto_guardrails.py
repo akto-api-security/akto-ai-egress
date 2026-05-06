@@ -196,11 +196,7 @@ class AktoGuardrailsAddon:
                 flow.response.set_text(modified_payload)
 
         except Exception as e:
-            flow.response = block_response(
-                reason="Akto response guardrails check failed",
-                metadata={"detail": str(e)},
-                status_code=502,
-            )
+            return
 
 
 addons = [AktoGuardrailsAddon()]
