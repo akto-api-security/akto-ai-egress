@@ -1,5 +1,6 @@
 import json
 import time
+import zlib
 import requests
 from mitmproxy import http
 
@@ -8,6 +9,7 @@ import os
 AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
 AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
+
 
 AI_HOSTS = {
     "api.openai.com",
@@ -77,38 +79,91 @@ def build_akto_payload(
         "metadata": json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"}),
         "contextSource": "AGENTIC",
     }
-    print("payload", xx)
     return xx
 
 
-def call_akto_request(flow: http.HTTPFlow) -> dict:
-    print ("evaluating request: ")
+def _call_akto(payload: dict, params: dict) -> dict:
+    print(f"[AKTO →] sending to Akto API | params: {params} | payload: {payload}")
     r = requests.get(
         AKTO_URL,
-        params={"guardrails": "true", "ingest_data": "true"},
+        params=params,
         headers={"Content-Type": "application/json"},
-        json=build_akto_payload(flow),
+        json=payload,
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()
+    result = r.json()
+    print(f"[AKTO ←] response from Akto API | {result}")
+    return result
+
+
+def call_akto_request(flow: http.HTTPFlow) -> dict:
+    print("[AKTO] request guardrail check")
+    return _call_akto(
+        build_akto_payload(flow),
+        {"guardrails": "true", "ingest_data": "true"},
+    )
+
+
+def extract_sse_events(raw: bytes) -> tuple:
+    """
+    Split raw bytes into complete SSE events (delimited by \\n\\n) and a leftover
+    incomplete tail. Also extracts text content from Anthropic and OpenAI delta events.
+    Returns: (complete_event_bytes, leftover_bytes, extracted_text)
+    """
+    parts = raw.split(b"\n\n")
+    complete_parts = parts[:-1]   # everything before the last \n\n is a complete event
+    leftover = parts[-1]          # last part may be incomplete
+
+    extracted_text = ""
+    for part in complete_parts:
+        for line in part.split(b"\n"):
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:]
+            if data.strip() == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+                # Anthropic: text content
+                delta = obj.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    extracted_text += delta.get("text", "")
+                # Anthropic: tool input (streamed JSON fragments)
+                if delta.get("type") == "input_json_delta":
+                    extracted_text += delta.get("partial_json", "")
+                # Anthropic: tool name from content_block_start
+                if obj.get("type") == "content_block_start":
+                    block = obj.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        extracted_text += f"[tool:{block.get('name', '')}]"
+                # OpenAI streaming format
+                for choice in obj.get("choices", []):
+                    extracted_text += choice.get("delta", {}).get("content", "") or ""
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    complete_bytes = b"\n\n".join(complete_parts)
+    if complete_parts:
+        complete_bytes += b"\n\n"
+
+    return complete_bytes, leftover, extracted_text
+
+
+def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
+    print(f"[AKTO] stream response guardrail check | {len(text_chunk)} chars | [{text_chunk}]")
+    return _call_akto(
+        build_akto_payload(flow, response_body=text_chunk, status_code=str(flow.response.status_code)),
+        {"response_guardrails": "true", "ingest_data": "false"},
+    )
 
 
 def call_akto_response(flow: http.HTTPFlow) -> dict:
-    print("evaluating response: ")
-    r = requests.get(
-        AKTO_URL,
-        params={"response_guardrails": "true", "ingest_data": "true"},
-        headers={"Content-Type": "application/json"},
-        json=build_akto_payload(
-            flow,
-            response_body=flow.response.get_text(strict=False) or "",
-            status_code=str(flow.response.status_code),
-        ),
-        timeout=15,
+    print("[AKTO] full response guardrail check")
+    return _call_akto(
+        build_akto_payload(flow, response_body=flow.response.get_text(strict=False) or "", status_code=str(flow.response.status_code)),
+        {"response_guardrails": "true", "ingest_data": "true"},
     )
-    r.raise_for_status()
-    return r.json()
 
 
 def get_request_result(result: dict) -> dict:
@@ -142,6 +197,86 @@ def block_response(reason: str, metadata=None, status_code: int = 403):
 
 
 class AktoGuardrailsAddon:
+    def responseheaders(self, flow: http.HTTPFlow):
+        if not is_ai_provider(flow):
+            return
+        content_type = flow.response.headers.get("content-type", "")
+        if "text/event-stream" not in content_type:
+            return  # non-streaming response — let the response hook handle it
+        content_encoding = flow.response.headers.get("content-encoding", "").lower()
+        flow.metadata["_akto_streaming"] = True
+        flow.metadata["_akto_gzip"] = "gzip" in content_encoding
+        flow.response.stream = self._make_stream_handler(flow)
+
+    def _make_stream_handler(self, flow: http.HTTPFlow):
+        # Two separate buffers:
+        #   pending_compressed — original wire bytes to forward to the client
+        #   decode_buffer      — decompressed bytes for SSE parsing / text extraction
+        # We decompress purely for guardrail evaluation; the client handles its own
+        # decompression via the original Content-Encoding header.
+        state = {
+            "pending_compressed": b"",
+            "decode_buffer": b"",
+            "decompressor": (
+                zlib.decompressobj(16 + zlib.MAX_WBITS)
+                if flow.metadata.get("_akto_gzip")
+                else None
+            ),
+        }
+
+        def stream_handler(chunk: bytes):
+            is_end = not chunk  # mitmproxy signals EOS with b""
+
+            if is_end:
+                # Flush any remaining compressed bytes; no text to guardrail
+                to_send = state["pending_compressed"]
+                state["pending_compressed"] = b""
+                if to_send:
+                    yield to_send
+                return
+
+            state["pending_compressed"] += chunk
+
+            # Decompress for SSE parsing; fall back to raw bytes if not compressed
+            if state["decompressor"]:
+                try:
+                    decoded = state["decompressor"].decompress(chunk)
+                except zlib.error as e:
+                    print(f"[AKTO] decompression error (using raw): {e}")
+                    decoded = chunk
+            else:
+                decoded = chunk
+
+            state["decode_buffer"] += decoded
+            _, leftover, chunk_text = extract_sse_events(state["decode_buffer"])
+            state["decode_buffer"] = leftover
+
+            if not chunk_text:
+                print(f"[AKTO] stream chunk: empty text, skipping guardrail check")
+                to_send = state["pending_compressed"]
+                state["pending_compressed"] = b""
+                yield to_send
+                return
+
+            try:
+                result = call_akto_response_stream(flow, chunk_text)
+                check = get_response_result(result)
+                allowed = check.get("Allowed") is True
+                behaviour = (check.get("behaviour") or "").lower()
+                if not allowed or behaviour == "block":
+                    reason = check.get("Reason") or "Blocked by Akto response guardrails"
+                    print(f"[AKTO] stream blocked: {reason}")
+                    flow.kill()
+                    return
+            except Exception as e:
+                print(f"[AKTO] stream guardrail error (fail open): {e}")
+
+            to_send = state["pending_compressed"]
+            state["pending_compressed"] = b""
+            yield to_send
+
+        return stream_handler
+
     def request(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
@@ -166,11 +301,14 @@ class AktoGuardrailsAddon:
                 flow.request.set_text(modified_payload)
 
         except Exception as e:
-            return   
+            return
+
     def response(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
 
+        if flow.metadata.get("_akto_streaming"):
+            return  # streaming path already ran guardrail checks
 
         if flow.response.headers.get("X-Akto-Guardrails-Decision") == "blocked":
             return
@@ -182,7 +320,7 @@ class AktoGuardrailsAddon:
             allowed = check.get("Allowed") is True
             modified = check.get("Modified") is True
             modified_payload = check.get("ModifiedPayload") or ""
-            behaviour = check.get("behaviour")
+            behaviour = (check.get("behaviour") or "").lower()
             reason = check.get("Reason") or "Blocked by Akto response guardrails"
 
             if not allowed or behaviour == "block":
