@@ -23,14 +23,11 @@ _RESPONSE_PARAMS = {"response_guardrails": "true", "ingest_data": "true"}
 
 print(f"[AKTO] URL: {AKTO_URL}")
 
-
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return flow.request.pretty_host in AI_HOSTS
 
-
 def safe_headers(headers) -> str:
     return json.dumps(dict(headers))
-
 
 def minimal_headers(headers) -> str:
     result = {}
@@ -41,7 +38,6 @@ def minimal_headers(headers) -> str:
         result["host"] = APP_NAME
     return json.dumps(result) if result else "{}"
 
-
 def extract_messages(flow: http.HTTPFlow) -> str:
     try:
         body = flow.request.get_text(strict=False) or ""
@@ -51,7 +47,6 @@ def extract_messages(flow: http.HTTPFlow) -> str:
         return json.dumps({"raw": data})
     except Exception:
         return ""
-
 
 def build_akto_payload(
     flow: http.HTTPFlow,
@@ -85,7 +80,6 @@ def build_akto_payload(
         "contextSource": "AGENTIC",
     }
 
-
 def _call_akto(payload: dict, params: dict) -> dict:
     print(f"[AKTO →] sending to Akto API | params: {params} | payload: {payload}")
     r = requests.get(
@@ -100,11 +94,9 @@ def _call_akto(payload: dict, params: dict) -> dict:
     print(f"[AKTO ←] response from Akto API | {result}")
     return result
 
-
 def call_akto_request(flow: http.HTTPFlow) -> dict:
     print("[AKTO] request guardrail check")
     return _call_akto(build_akto_payload(flow), _REQUEST_PARAMS)
-
 
 def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
     print(f"[AKTO] stream response guardrail check | {len(text_chunk)} chars | [{text_chunk}]")
@@ -113,7 +105,6 @@ def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
         _RESPONSE_PARAMS,
     )
 
-
 def call_akto_response(flow: http.HTTPFlow) -> dict:
     print("[AKTO] full response guardrail check")
     return _call_akto(
@@ -121,20 +112,16 @@ def call_akto_response(flow: http.HTTPFlow) -> dict:
         _RESPONSE_PARAMS,
     )
 
-
 def _get_guardrails_result(result: dict) -> dict:
     return result.get("data", {}).get("guardrailsResult", {})
-
 
 def get_request_result(result: dict) -> dict:
     gr = _get_guardrails_result(result)
     # handles both schema variants: requestResult nested or flat
     return gr.get("requestResult", gr)
 
-
 def get_response_result(result: dict) -> dict:
     return _get_guardrails_result(result)
-
 
 def block_response(reason: str, metadata=None, status_code: int = 403):
     return http.Response.make(
@@ -145,7 +132,6 @@ def block_response(reason: str, metadata=None, status_code: int = 403):
         }),
         {"Content-Type": "application/json", "X-Akto-Guardrails-Decision": "blocked"},
     )
-
 
 def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, target) -> bool:
     """Apply guardrail result to flow. Returns True if the request/response was blocked."""
@@ -163,7 +149,6 @@ def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, targe
         target.set_text(check["ModifiedPayload"])
 
     return False
-
 
 def extract_sse_events(raw: bytes) -> tuple:
     """
@@ -208,7 +193,6 @@ def extract_sse_events(raw: bytes) -> tuple:
         complete_bytes += b"\n\n"
 
     return complete_bytes, leftover, extracted_text
-
 
 class AktoGuardrailsAddon:
     def responseheaders(self, flow: http.HTTPFlow):
@@ -315,6 +299,5 @@ class AktoGuardrailsAddon:
             _apply_guardrail_check(flow, check, "response", flow.response)
         except Exception as e:
             print(f"[AKTO] response guardrail error (fail open): {e}")
-
 
 addons = [AktoGuardrailsAddon()]
