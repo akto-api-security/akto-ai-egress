@@ -3,14 +3,17 @@ import os
 import time
 import zlib
 
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 from mitmproxy import http
 
 AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
-AKTO_ENABLED = bool(AKTO_URL)
+# AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
 
-TEXT_THRESHOLD = 500  # chars of extracted text per guardrail batch
+TEXT_THRESHOLD = int(os.getenv("AKTO_TEXT_THRESHOLD", "200"))  # tune via env after measuring API latency
+_executor = ThreadPoolExecutor(max_workers=8)
 
 AI_HOSTS = {
     "api.openai.com",
@@ -21,7 +24,7 @@ _AGENTIC_TAG = json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"})
 _REQUEST_PARAMS = {"guardrails": "true", "ingest_data": "true"}
 _RESPONSE_PARAMS = {"response_guardrails": "true", "ingest_data": "true"}
 
-print(f"[AKTO] URL: {AKTO_URL}")
+print(f"[AKTO] starting | url={AKTO_URL} | threshold={TEXT_THRESHOLD} chars")
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return flow.request.pretty_host in AI_HOSTS
@@ -80,8 +83,9 @@ def build_akto_payload(
         "contextSource": "AGENTIC",
     }
 
-def _call_akto(payload: dict, params: dict) -> dict:
-    print(f"[AKTO →] sending to Akto API | params: {params} | payload: {payload}")
+def _call_akto(payload: dict, params: dict, label: str = "payload") -> dict:
+    print(f"[AKTO] {label} | {payload}")
+    t0 = time.time()
     r = requests.get(
         AKTO_URL,
         params=params,
@@ -91,25 +95,28 @@ def _call_akto(payload: dict, params: dict) -> dict:
     )
     r.raise_for_status()
     result = r.json()
-    print(f"[AKTO ←] response from Akto API | {result}")
+    latency_ms = (time.time() - t0) * 1000
+    print(f"[AKTO] response | latency={latency_ms:.0f}ms | {result}")
     return result
 
 def call_akto_request(flow: http.HTTPFlow) -> dict:
-    print("[AKTO] request guardrail check")
-    return _call_akto(build_akto_payload(flow), _REQUEST_PARAMS)
+    print(f"[AKTO] REQUEST  | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
+    return _call_akto(build_akto_payload(flow), _REQUEST_PARAMS, label="request payload")
 
 def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
-    print(f"[AKTO] stream response guardrail check | {len(text_chunk)} chars | [{text_chunk}]")
+    print(f"[AKTO] STREAM   | {len(text_chunk)} chars | [{text_chunk}]")
     return _call_akto(
         build_akto_payload(flow, response_body=text_chunk, status_code=str(flow.response.status_code)),
         _RESPONSE_PARAMS,
+        label="stream payload",
     )
 
 def call_akto_response(flow: http.HTTPFlow) -> dict:
-    print("[AKTO] full response guardrail check")
+    print(f"[AKTO] RESPONSE | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
     return _call_akto(
         build_akto_payload(flow, response_body=flow.response.get_text(strict=False) or "", status_code=str(flow.response.status_code)),
         _RESPONSE_PARAMS,
+        label="response payload",
     )
 
 def _get_guardrails_result(result: dict) -> dict:
@@ -143,7 +150,7 @@ def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, targe
         return True
 
     if check.get("Allowed") is not True:
-        print(f"[AKTO] {context} alert (allowed=false, behaviour={behaviour or 'none'}): {reason}")
+        print(f"[AKTO] {context.upper()} | alert | behaviour={behaviour or 'none'} | {reason}")
 
     if check.get("Modified") is True and check.get("ModifiedPayload"):
         target.set_text(check["ModifiedPayload"])
@@ -211,15 +218,44 @@ class AktoGuardrailsAddon:
 
     def _make_stream_handler(self, flow: http.HTTPFlow):
         state = {
-            "pending": b"",
-            "decode_buffer": b"",
-            "text_buffer": "",
+            "batch_bytes": b"",    # raw bytes for the batch currently accumulating
+            "batch_text": "",      # extracted text for the batch currently accumulating
+            "decode_buffer": b"",  # SSE parse window
+            "inflight": None,      # {"future": Future, "bytes": bytes} for the in-flight API call
             "decompressor": (
                 zlib.decompressobj(16 + zlib.MAX_WBITS)
                 if flow.metadata.get("_akto_gzip")
                 else None
             ),
         }
+
+        def _wait_inflight():
+            """Wait for the in-flight API result. Returns (approved_bytes, block_reason)."""
+            entry = state["inflight"]
+            state["inflight"] = None
+            t_wait = time.time()
+            try:
+                result = entry["future"].result()
+                waited_ms = (time.time() - t_wait) * 1000
+                pipeline_ok = "pipeline ok" if waited_ms < 50 else f"waited {waited_ms:.0f}ms"
+                check = get_response_result(result)
+                behaviour = (check.get("behaviour") or "").lower()
+                if behaviour == "block":
+                    print(f"[AKTO] STREAM   | collecting result | {pipeline_ok}")
+                    return b"", check.get("Reason") or "Blocked by Akto response guardrails"
+                if check.get("Allowed") is not True:
+                    print(f"[AKTO] STREAM   | alert | {pipeline_ok} | {check.get('Reason', '')}")
+                else:
+                    print(f"[AKTO] STREAM   | collecting result | {pipeline_ok}")
+            except Exception as e:
+                print(f"[AKTO] STREAM   | error (fail open) | {e}")
+            return entry["bytes"], None
+
+        def _make_block_event(reason: str) -> bytes:
+            return (
+                f'data: {json.dumps({"type": "error", "error": {"type": "permission_error", "message": reason}})}\n\n'
+                f'data: [DONE]\n\n'
+            ).encode()
 
         def stream_handler(chunk: bytes):
             is_end = not chunk
@@ -234,47 +270,53 @@ class AktoGuardrailsAddon:
                 else:
                     decoded = chunk
 
-                state["pending"] += decoded
+                state["batch_bytes"] += decoded
                 state["decode_buffer"] += decoded
                 _, leftover, chunk_text = extract_sse_events(state["decode_buffer"])
                 state["decode_buffer"] = leftover
-                state["text_buffer"] += chunk_text
+                state["batch_text"] += chunk_text
 
             should_flush = (
-                len(state["text_buffer"]) >= TEXT_THRESHOLD
-                or (is_end and state["pending"])
+                len(state["batch_text"]) >= TEXT_THRESHOLD
+                or (is_end and (state["batch_bytes"] or state["inflight"]))
             )
 
             if not should_flush:
                 return
 
-            if not state["text_buffer"]:
-                print("[AKTO] stream flush: empty text buffer, skipping guardrail check")
-            else:
-                try:
-                    result = call_akto_response_stream(flow, state["text_buffer"])
-                    check = get_response_result(result)
-                    behaviour = (check.get("behaviour") or "").lower()
-                    if behaviour == "block":
-                        reason = check.get("Reason") or "Blocked by Akto response guardrails"
-                        print(f"[AKTO] stream blocked: {reason}")
-                        state["pending"] = b""
-                        state["text_buffer"] = ""
-                        block_event = (
-                            f'data: {json.dumps({"type": "error", "error": {"type": "permission_error", "message": reason}})}\n\n'
-                            f'data: [DONE]\n\n'
-                        ).encode()
-                        yield block_event
-                        return
-                    if check.get("Allowed") is not True:
-                        print(f"[AKTO] stream alert (allowed=false, behaviour={behaviour or 'none'}): {check.get('Reason', '')}")
-                except Exception as e:
-                    print(f"[AKTO] stream guardrail error (fail open): {e}")
+            # Step 1: collect result from the previous batch's in-flight API call
+            if state["inflight"]:
+                approved_bytes, block_reason = _wait_inflight()
+                if block_reason:
+                    print(f"[AKTO] STREAM   | BLOCKED | {block_reason}")
+                    state["batch_bytes"] = b""
+                    state["batch_text"] = ""
+                    yield _make_block_event(block_reason)
+                    return
+                yield approved_bytes
 
-            to_send = state["pending"]
-            state["pending"] = b""
-            state["text_buffer"] = ""
-            yield to_send
+            # Step 2: fire API call for the current batch in the background
+            if state["batch_text"]:
+                print(f"[AKTO] STREAM   | firing async | {len(state['batch_text'])} chars")
+                state["inflight"] = {
+                    "future": _executor.submit(call_akto_response_stream, flow, state["batch_text"]),
+                    "bytes": state["batch_bytes"],
+                }
+                state["batch_bytes"] = b""
+                state["batch_text"] = ""
+            elif state["batch_bytes"]:
+                # No text content (pure metadata SSE events) — forward directly, no guardrail needed
+                yield state["batch_bytes"]
+                state["batch_bytes"] = b""
+
+            # Step 3: on stream end, drain the final in-flight batch
+            if is_end and state["inflight"]:
+                approved_bytes, block_reason = _wait_inflight()
+                if block_reason:
+                    print(f"[AKTO] STREAM   | BLOCKED | {block_reason}")
+                    yield _make_block_event(block_reason)
+                    return
+                yield approved_bytes
 
         return stream_handler
 
@@ -285,7 +327,7 @@ class AktoGuardrailsAddon:
             check = get_request_result(call_akto_request(flow))
             _apply_guardrail_check(flow, check, "request", flow.request)
         except Exception as e:
-            print(f"[AKTO] request guardrail error (fail open): {e}")
+            print(f"[AKTO] REQUEST  | error (fail open) | {e}")
 
     def response(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
@@ -298,6 +340,6 @@ class AktoGuardrailsAddon:
             check = get_response_result(call_akto_response(flow))
             _apply_guardrail_check(flow, check, "response", flow.response)
         except Exception as e:
-            print(f"[AKTO] response guardrail error (fail open): {e}")
+            print(f"[AKTO] RESPONSE | error (fail open) | {e}")
 
 addons = [AktoGuardrailsAddon()]
