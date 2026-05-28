@@ -204,19 +204,20 @@ class AktoGuardrailsAddon:
         if "text/event-stream" not in content_type:
             return  # non-streaming response — let the response hook handle it
         content_encoding = flow.response.headers.get("content-encoding", "").lower()
+        is_gzip = "gzip" in content_encoding
         flow.metadata["_akto_streaming"] = True
-        flow.metadata["_akto_gzip"] = "gzip" in content_encoding
+        flow.metadata["_akto_gzip"] = is_gzip
+        if is_gzip:
+            # Strip encoding so we can forward decoded bytes and inject plain-text SSE events on block
+            del flow.response.headers["content-encoding"]
         flow.response.stream = self._make_stream_handler(flow)
 
     def _make_stream_handler(self, flow: http.HTTPFlow):
-        # Two separate buffers:
-        #   pending_compressed — original wire bytes to forward to the client
-        #   decode_buffer      — decompressed bytes for SSE parsing / text extraction
-        # We decompress purely for guardrail evaluation; the client handles its own
-        # decompression via the original Content-Encoding header.
+        # Single decoded buffer for forwarding — Content-Encoding was stripped in responseheaders
+        # so we can inject plain-text SSE block events when needed.
         state = {
-            "pending_compressed": b"",
-            "decode_buffer": b"",
+            "pending": b"",       # decoded bytes buffered for forwarding
+            "decode_buffer": b"", # SSE parse window (decoded)
             "decompressor": (
                 zlib.decompressobj(16 + zlib.MAX_WBITS)
                 if flow.metadata.get("_akto_gzip")
@@ -228,16 +229,12 @@ class AktoGuardrailsAddon:
             is_end = not chunk  # mitmproxy signals EOS with b""
 
             if is_end:
-                # Flush any remaining compressed bytes; no text to guardrail
-                to_send = state["pending_compressed"]
-                state["pending_compressed"] = b""
+                to_send = state["pending"]
+                state["pending"] = b""
                 if to_send:
                     yield to_send
                 return
 
-            state["pending_compressed"] += chunk
-
-            # Decompress for SSE parsing; fall back to raw bytes if not compressed
             if state["decompressor"]:
                 try:
                     decoded = state["decompressor"].decompress(chunk)
@@ -247,32 +244,42 @@ class AktoGuardrailsAddon:
             else:
                 decoded = chunk
 
+            state["pending"] += decoded
             state["decode_buffer"] += decoded
             _, leftover, chunk_text = extract_sse_events(state["decode_buffer"])
             state["decode_buffer"] = leftover
 
             if not chunk_text:
                 print(f"[AKTO] stream chunk: empty text, skipping guardrail check")
-                to_send = state["pending_compressed"]
-                state["pending_compressed"] = b""
+                to_send = state["pending"]
+                state["pending"] = b""
                 yield to_send
                 return
 
             try:
                 result = call_akto_response_stream(flow, chunk_text)
                 check = get_response_result(result)
-                allowed = check.get("Allowed") is True
                 behaviour = (check.get("behaviour") or "").lower()
-                if not allowed or behaviour == "block":
+                if behaviour == "block":
                     reason = check.get("Reason") or "Blocked by Akto response guardrails"
                     print(f"[AKTO] stream blocked: {reason}")
-                    flow.kill()
+                    # Discard buffered real content; deliver a terminal SSE error event
+                    # so the client receives the block message and closes cleanly.
+                    state["pending"] = b""
+                    block_event = (
+                        f'data: {json.dumps({"type": "error", "error": {"type": "permission_error", "message": reason}})}\n\n'
+                        f'data: [DONE]\n\n'
+                    ).encode()
+                    yield block_event
                     return
+                allowed = check.get("Allowed") is True
+                if not allowed:
+                    print(f"[AKTO] stream alert (allowed=false, behaviour={behaviour or 'none'}): {check.get('Reason', '')}")
             except Exception as e:
                 print(f"[AKTO] stream guardrail error (fail open): {e}")
 
-            to_send = state["pending_compressed"]
-            state["pending_compressed"] = b""
+            to_send = state["pending"]
+            state["pending"] = b""
             yield to_send
 
         return stream_handler
@@ -317,18 +324,21 @@ class AktoGuardrailsAddon:
             result = call_akto_response(flow)
             check = get_response_result(result)
 
+            behaviour = (check.get("behaviour") or "").lower()
             allowed = check.get("Allowed") is True
             modified = check.get("Modified") is True
             modified_payload = check.get("ModifiedPayload") or ""
-            behaviour = (check.get("behaviour") or "").lower()
             reason = check.get("Reason") or "Blocked by Akto response guardrails"
 
-            if not allowed or behaviour == "block":
+            if behaviour == "block":
                 flow.response = block_response(
                     reason=reason,
                     metadata=check.get("Metadata", {}),
                 )
                 return
+
+            if not allowed:
+                print(f"[AKTO] response alert (allowed=false, behaviour={behaviour or 'none'}): {reason}")
 
             if modified and modified_payload:
                 flow.response.set_text(modified_payload)
