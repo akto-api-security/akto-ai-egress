@@ -116,10 +116,11 @@ def _call_akto_sync(payload: dict, params: dict, label: str = "payload", timeout
     r.raise_for_status()
     result = r.json()
     latency_ms = (time.time() - t0) * 1000
+    check_type = label.replace(" payload", "")
     if LOG_PAYLOADS:
-        print(f"[AKTO] response | latency={latency_ms:.0f}ms | {result}")
+        print(f"[AKTO] response | {check_type} | latency={latency_ms:.0f}ms | {result}")
     else:
-        print(f"[AKTO] response | latency={latency_ms:.0f}ms")
+        print(f"[AKTO] response | {check_type} | latency={latency_ms:.0f}ms")
     return result
 
 async def _call_akto(payload: dict, params: dict, label: str = "payload") -> dict:
@@ -133,8 +134,9 @@ async def call_akto_request(flow: http.HTTPFlow) -> dict:
 def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
     # sync — called from _stream_executor in the stream handler
     print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | {len(text_chunk)} chars | [{text_chunk}]")
+    response_body = json.dumps({"content": [{"type": "text", "text": text_chunk}]})
     return _call_akto_sync(
-        build_akto_payload(flow, response_body=text_chunk, status_code=str(flow.response.status_code)),
+        build_akto_payload(flow, response_body=response_body, status_code=str(flow.response.status_code)),
         _RESPONSE_PARAMS,
         label="stream payload",
         timeout=5,
@@ -184,7 +186,6 @@ def _make_graceful_sse_block(reason: str, provider: str = "anthropic") -> bytes:
             "data: [DONE]\n\n",
         ]
     payload = "".join(events).encode()
-    print(f"[AKTO] BLOCK    | full SSE block sent ({provider}) | reason: {reason}")
     return payload
 
 def _make_graceful_sse_continuation(reason: str, provider: str = "anthropic") -> bytes:
@@ -207,7 +208,6 @@ def _make_graceful_sse_continuation(reason: str, provider: str = "anthropic") ->
             "data: [DONE]\n\n",
         ]
     payload = "".join(events).encode()
-    print(f"[AKTO] BLOCK    | continuation SSE sent ({provider}) | reason: {reason}")
     return payload
 
 def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, target) -> bool:
@@ -363,7 +363,8 @@ class AktoGuardrailsAddon:
             if state["inflight"]:
                 approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
-                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
+                    sse_type = "continuation" if state["anything_sent"] else "full SSE block"
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {sse_type} sent | {block_reason}")
                     state["batch_bytes"] = b""
                     state["batch_text"] = ""
                     yield _block_event(block_reason)
@@ -390,7 +391,8 @@ class AktoGuardrailsAddon:
             if is_end and state["inflight"]:
                 approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
-                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
+                    sse_type = "continuation" if state["anything_sent"] else "full SSE block"
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {sse_type} sent | {block_reason}")
                     yield _block_event(block_reason)
                     return
                 state["anything_sent"] = True
