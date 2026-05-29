@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -9,11 +10,13 @@ import requests
 from mitmproxy import http
 
 AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
-# AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
 
-TEXT_THRESHOLD = int(os.getenv("AKTO_TEXT_THRESHOLD", "200"))  # tune via env after measuring API latency
-_executor = ThreadPoolExecutor(max_workers=8)
+TEXT_THRESHOLD  = int(os.getenv("AKTO_TEXT_THRESHOLD", "600"))
+LOG_PAYLOADS    = os.getenv("AKTO_LOG_PAYLOADS", "").lower() == "true"
+_hook_executor   = ThreadPoolExecutor(max_workers=4)   # request/response hook API calls
+_stream_executor = ThreadPoolExecutor(max_workers=8)   # stream batch API calls (1 per agent)
+_session = requests.Session()                          # shared connection pool to Akto
 
 AI_HOSTS = {
     "api.openai.com",
@@ -24,13 +27,26 @@ _AGENTIC_TAG = json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"})
 _REQUEST_PARAMS = {"guardrails": "true", "ingest_data": "true"}
 _RESPONSE_PARAMS = {"response_guardrails": "true", "ingest_data": "true"}
 
-print(f"[AKTO] starting | url={AKTO_URL} | threshold={TEXT_THRESHOLD} chars")
+print(
+    f"[AKTO] starting"
+    f" | url={AKTO_URL}"
+    f" | threshold={TEXT_THRESHOLD} chars"
+    f" | log_payloads={LOG_PAYLOADS}"
+    f" | hook_workers={_hook_executor._max_workers}"
+    f" | stream_workers={_stream_executor._max_workers}"
+    f" | stream_timeout=5s"
+)
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return flow.request.pretty_host in AI_HOSTS
 
 def _provider(flow: http.HTTPFlow) -> str:
     return "openai" if "openai" in flow.request.pretty_host else "anthropic"
+
+def _agent_id(flow: http.HTTPFlow) -> str:
+    if flow.client_conn.peername:
+        return f"{flow.client_conn.peername[0]}:{flow.client_conn.peername[1]}"
+    return "unknown"
 
 def safe_headers(headers) -> str:
     return json.dumps(dict(headers))
@@ -86,37 +102,47 @@ def build_akto_payload(
         "contextSource": "AGENTIC",
     }
 
-def _call_akto(payload: dict, params: dict, label: str = "payload") -> dict:
-    print(f"[AKTO] {label} | {payload}")
+def _call_akto_sync(payload: dict, params: dict, label: str = "payload", timeout: int = 15) -> dict:
+    if LOG_PAYLOADS:
+        print(f"[AKTO] {label} | {payload}")
     t0 = time.time()
-    r = requests.get(
+    r = _session.get(
         AKTO_URL,
         params=params,
         headers={"Content-Type": "application/json"},
         json=payload,
-        timeout=15,
+        timeout=timeout,
     )
     r.raise_for_status()
     result = r.json()
     latency_ms = (time.time() - t0) * 1000
-    print(f"[AKTO] response | latency={latency_ms:.0f}ms | {result}")
+    if LOG_PAYLOADS:
+        print(f"[AKTO] response | latency={latency_ms:.0f}ms | {result}")
+    else:
+        print(f"[AKTO] response | latency={latency_ms:.0f}ms")
     return result
 
-def call_akto_request(flow: http.HTTPFlow) -> dict:
-    print(f"[AKTO] REQUEST  | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
-    return _call_akto(build_akto_payload(flow), _REQUEST_PARAMS, label="request payload")
+async def _call_akto(payload: dict, params: dict, label: str = "payload") -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_hook_executor, lambda: _call_akto_sync(payload, params, label))
+
+async def call_akto_request(flow: http.HTTPFlow) -> dict:
+    print(f"[AKTO] REQUEST  | agent={_agent_id(flow)} | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
+    return await _call_akto(build_akto_payload(flow), _REQUEST_PARAMS, label="request payload")
 
 def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
-    print(f"[AKTO] STREAM   | {len(text_chunk)} chars | [{text_chunk}]")
-    return _call_akto(
+    # sync — called from _stream_executor in the stream handler
+    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | {len(text_chunk)} chars | [{text_chunk}]")
+    return _call_akto_sync(
         build_akto_payload(flow, response_body=text_chunk, status_code=str(flow.response.status_code)),
         _RESPONSE_PARAMS,
         label="stream payload",
+        timeout=5,
     )
 
-def call_akto_response(flow: http.HTTPFlow) -> dict:
-    print(f"[AKTO] RESPONSE | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
-    return _call_akto(
+async def call_akto_response(flow: http.HTTPFlow) -> dict:
+    print(f"[AKTO] RESPONSE | agent={_agent_id(flow)} | {flow.request.method} {flow.request.pretty_host}{flow.request.path}")
+    return await _call_akto(
         build_akto_payload(flow, response_body=flow.response.get_text(strict=False) or "", status_code=str(flow.response.status_code)),
         _RESPONSE_PARAMS,
         label="response payload",
@@ -284,29 +310,29 @@ class AktoGuardrailsAddon:
             return (_make_graceful_sse_continuation(reason, p) if state["anything_sent"]
                     else _make_graceful_sse_block(reason, p))
 
-        def _wait_inflight():
-            """Wait for the in-flight API result. Returns (approved_bytes, block_reason)."""
+        async def _wait_inflight():
+            """Await the in-flight API result without blocking the event loop."""
             entry = state["inflight"]
             state["inflight"] = None
             t_wait = time.time()
             try:
-                result = entry["future"].result()
+                result = await asyncio.wrap_future(entry["future"])
                 waited_ms = (time.time() - t_wait) * 1000
                 pipeline_ok = "pipeline ok" if waited_ms < 50 else f"waited {waited_ms:.0f}ms"
                 check = get_response_result(result)
                 behaviour = (check.get("behaviour") or "").lower()
                 if behaviour == "block":
-                    print(f"[AKTO] STREAM   | collecting result | {pipeline_ok}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | collecting result | {pipeline_ok}")
                     return b"", check.get("Reason") or "Blocked by Akto response guardrails"
                 if check.get("Allowed") is not True:
-                    print(f"[AKTO] STREAM   | alert | {pipeline_ok} | {check.get('Reason', '')}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | alert | {pipeline_ok} | {check.get('Reason', '')}")
                 else:
-                    print(f"[AKTO] STREAM   | collecting result | {pipeline_ok}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | collecting result | {pipeline_ok}")
             except Exception as e:
                 print(f"[AKTO] STREAM   | error (fail open) | {e}")
             return entry["bytes"], None
 
-        def stream_handler(chunk: bytes):
+        async def stream_handler(chunk: bytes):
             is_end = not chunk
 
             if not is_end:
@@ -335,9 +361,9 @@ class AktoGuardrailsAddon:
 
             # Step 1: collect result from the previous batch's in-flight API call
             if state["inflight"]:
-                approved_bytes, block_reason = _wait_inflight()
+                approved_bytes, block_reason = await _wait_inflight()
                 if block_reason:
-                    print(f"[AKTO] STREAM   | BLOCKED | {block_reason}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
                     state["batch_bytes"] = b""
                     state["batch_text"] = ""
                     yield _block_event(block_reason)
@@ -347,9 +373,9 @@ class AktoGuardrailsAddon:
 
             # Step 2: fire API call for the current batch in the background
             if state["batch_text"]:
-                print(f"[AKTO] STREAM   | firing async | {len(state['batch_text'])} chars")
+                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async | {len(state['batch_text'])} chars")
                 state["inflight"] = {
-                    "future": _executor.submit(call_akto_response_stream, flow, state["batch_text"]),
+                    "future": _stream_executor.submit(call_akto_response_stream, flow, state["batch_text"]),
                     "bytes": state["batch_bytes"],
                 }
                 state["batch_bytes"] = b""
@@ -362,9 +388,9 @@ class AktoGuardrailsAddon:
 
             # Step 3: on stream end, drain the final in-flight batch
             if is_end and state["inflight"]:
-                approved_bytes, block_reason = _wait_inflight()
+                approved_bytes, block_reason = await _wait_inflight()
                 if block_reason:
-                    print(f"[AKTO] STREAM   | BLOCKED | {block_reason}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
                     yield _block_event(block_reason)
                     return
                 state["anything_sent"] = True
@@ -372,16 +398,16 @@ class AktoGuardrailsAddon:
 
         return stream_handler
 
-    def request(self, flow: http.HTTPFlow):
+    async def request(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
         try:
-            check = get_request_result(call_akto_request(flow))
+            check = get_request_result(await call_akto_request(flow))
             _apply_guardrail_check(flow, check, "request", flow.request)
         except Exception as e:
             print(f"[AKTO] REQUEST  | error (fail open) | {e}")
 
-    def response(self, flow: http.HTTPFlow):
+    async def response(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
         if flow.metadata.get("_akto_streaming"):
@@ -389,7 +415,7 @@ class AktoGuardrailsAddon:
         if flow.response.headers.get("X-Akto-Guardrails-Decision") == "blocked":
             return
         try:
-            check = get_response_result(call_akto_response(flow))
+            check = get_response_result(await call_akto_response(flow))
             _apply_guardrail_check(flow, check, "response", flow.response)
         except Exception as e:
             print(f"[AKTO] RESPONSE | error (fail open) | {e}")
