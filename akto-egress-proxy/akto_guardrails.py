@@ -168,6 +168,7 @@ def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, targe
     reason = check.get("Reason") or f"Blocked by Akto {context} guardrails"
 
     if behaviour == "block":
+        print(f"[AKTO] {context.upper()} | decision=BLOCKED | {reason}")
         flow.response = http.Response.make(
             403,
             json.dumps({"error": reason}),
@@ -312,8 +313,7 @@ class AktoGuardrailsAddon:
             if state["inflight"]:
                 approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
-                    sse_type = "continuation" if state["anything_sent"] else "full SSE block"
-                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {sse_type} sent | {block_reason}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {block_reason}")
                     state["batch_bytes"] = b""
                     state["batch_text"] = ""
                     yield _block_event(block_reason)
@@ -340,8 +340,7 @@ class AktoGuardrailsAddon:
             if is_end and state["inflight"]:
                 approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
-                    sse_type = "continuation" if state["anything_sent"] else "full SSE block"
-                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {sse_type} sent | {block_reason}")
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {block_reason}")
                     yield _block_event(block_reason)
                     return
                 state["anything_sent"] = True
