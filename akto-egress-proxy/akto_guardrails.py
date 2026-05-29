@@ -161,54 +161,6 @@ def get_request_result(result: dict) -> dict:
 def get_response_result(result: dict) -> dict:
     return _get_guardrails_result(result)
 
-def _sse_event(event_type: str, obj: dict) -> str:
-    return f"event: {event_type}\ndata: {json.dumps(obj)}\n\n"
-
-def _make_graceful_sse_block(reason: str, provider: str = "anthropic") -> bytes:
-    """Full SSE message sequence — used when no chunks have been sent yet."""
-    if provider == "openai":
-        ts = int(time.time())
-        base = {"id": "chatcmpl-blocked", "object": "chat.completion.chunk", "created": ts, "model": "unknown"}
-        events = [
-            f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'content': reason}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n",
-            "data: [DONE]\n\n",
-        ]
-    else:
-        events = [
-            _sse_event("message_start",       {"type": "message_start", "message": {"id": "msg_blocked", "type": "message", "role": "assistant", "content": [], "model": "unknown", "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}),
-            _sse_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-            _sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reason}}),
-            _sse_event("content_block_stop",  {"type": "content_block_stop", "index": 0}),
-            _sse_event("message_delta",       {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 1}}),
-            _sse_event("message_stop",        {"type": "message_stop"}),
-            "data: [DONE]\n\n",
-        ]
-    payload = "".join(events).encode()
-    return payload
-
-def _make_graceful_sse_continuation(reason: str, provider: str = "anthropic") -> bytes:
-    """Tail SSE events only — used when message_start was already sent in an earlier batch."""
-    if provider == "openai":
-        ts = int(time.time())
-        base = {"id": "chatcmpl-blocked", "object": "chat.completion.chunk", "created": ts, "model": "unknown"}
-        continuation_text = "\n\n" + reason
-        events = [
-            f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'content': continuation_text}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n",
-            "data: [DONE]\n\n",
-        ]
-    else:
-        events = [
-            _sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": f"\n\n{reason}"}}),
-            _sse_event("content_block_stop",  {"type": "content_block_stop", "index": 0}),
-            _sse_event("message_delta",       {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 1}}),
-            _sse_event("message_stop",        {"type": "message_stop"}),
-            "data: [DONE]\n\n",
-        ]
-    payload = "".join(events).encode()
-    return payload
 
 def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, target) -> bool:
     """Apply guardrail result to flow. Returns True if the request/response was blocked."""
@@ -217,10 +169,9 @@ def _apply_guardrail_check(flow: http.HTTPFlow, check: dict, context: str, targe
 
     if behaviour == "block":
         flow.response = http.Response.make(
-            200,
-            _make_graceful_sse_block(reason, _provider(flow)),
-            {"Content-Type": "text/event-stream; charset=utf-8",
-             "X-Akto-Guardrails-Decision": "blocked"},
+            403,
+            json.dumps({"error": reason}),
+            {"Content-Type": "application/json", "X-Akto-Guardrails-Decision": "blocked"},
         )
         return True
 
@@ -306,9 +257,7 @@ class AktoGuardrailsAddon:
         }
 
         def _block_event(reason: str) -> bytes:
-            p = _provider(flow)
-            return (_make_graceful_sse_continuation(reason, p) if state["anything_sent"]
-                    else _make_graceful_sse_block(reason, p))
+            return f'data: {json.dumps({"error": reason})}\n\ndata: [DONE]\n\n'.encode()
 
         def _wait_inflight():
             """Wait for the in-flight API result. Returns (approved_bytes, block_reason)."""

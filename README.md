@@ -15,8 +15,8 @@ docker compose up --build
 
 Every outbound request from an agent to an AI provider flows through the proxy:
 
-1. **Request check** — the prompt is sent to Akto guardrails before reaching the LLM. Blocked requests receive a graceful SSE response containing the block reason instead of a 403 error.
-2. **Streaming response check** — LLM output is intercepted chunk by chunk. Chunks are accumulated until a text threshold is reached, then guardrailed as a batch. Approved batches are forwarded to the agent; blocked batches terminate the stream with a graceful block message.
+1. **Request check** — the prompt is sent to Akto guardrails before reaching the LLM. Blocked requests receive a `403` with the block reason by default, or a graceful SSE response if the SSE formatter is enabled.
+2. **Streaming response check** — LLM output is intercepted chunk by chunk. Chunks are accumulated until a text threshold is reached, then guardrailed as a batch. Approved batches are forwarded to the agent; blocked batches terminate the stream with an error event by default, or a graceful SSE block message if the SSE formatter is enabled.
 3. **Full response check (non-streaming)** — for non-SSE responses, the complete response body is guardrailed before delivery.
 
 ### Streaming Architecture
@@ -36,12 +36,21 @@ Every outbound request from an agent to an AI provider flows through the proxy:
 
 Tool calls are also guardrailed — the tool name and streamed input JSON are extracted and evaluated alongside text responses.
 
-### Graceful Blocks
+### Block Behaviour
 
-When a block is detected, the proxy returns a valid LLM streaming response (not a 403) so the agent handles it gracefully:
+Blocks return a `403` response with the block reason as JSON:
 
-- **First batch blocked**: full SSE message sequence with the block reason as text content.
-- **Mid-stream block**: continuation SSE events appending the block reason to the already-started stream, followed by a clean close.
+```json
+{"error": "<block reason from Akto>"}
+```
+
+For streaming blocks (mid-stream), a simple SSE error event is sent instead since response headers are already committed:
+
+```
+data: {"error": "<block reason>"}
+
+data: [DONE]
+```
 
 ## Environment Variables
 
@@ -69,7 +78,7 @@ The proxy supports up to **8 concurrent streaming agents** out of the box. Reque
 - **Chunk-by-chunk streaming guardrail** — LLM output is held from the agent, guardrailed in batches, and only forwarded once approved. Nothing reaches the agent before it is validated.
 - **Pipelined async checks** — while batch N is being evaluated by Akto, batch N+1 is already accumulating. Guardrail API calls across all agents fire concurrently in a background thread pool.
 - **Tool call interception** — tool names and tool input (streamed as JSON fragments) are extracted and guardrailed alongside text, catching malicious tool invocations and indirect prompt injection via fetched content.
-- **Graceful block responses** — blocked requests and responses are returned as valid LLM streaming messages containing the block reason, not HTTP errors. The agent handles them as normal responses.
+- **Block responses** — blocked requests return `403` with the block reason as JSON. Mid-stream blocks send a simple SSE error event followed by `[DONE]`.
 - **Multi-provider support** — works transparently with both Anthropic and OpenAI streaming APIs, auto-detecting the provider per request.
 - **Transparent gzip decompression** — compressed SSE responses are decompressed for guardrail evaluation and forwarded in their original compressed form to the agent.
 - **Fail open** — if the Akto API is unreachable or times out, traffic is allowed through so agent availability is never blocked by guardrail infrastructure issues.
