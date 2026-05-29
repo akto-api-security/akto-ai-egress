@@ -310,13 +310,13 @@ class AktoGuardrailsAddon:
             return (_make_graceful_sse_continuation(reason, p) if state["anything_sent"]
                     else _make_graceful_sse_block(reason, p))
 
-        async def _wait_inflight():
-            """Await the in-flight API result without blocking the event loop."""
+        def _wait_inflight():
+            """Wait for the in-flight API result. Returns (approved_bytes, block_reason)."""
             entry = state["inflight"]
             state["inflight"] = None
             t_wait = time.time()
             try:
-                result = await asyncio.wrap_future(entry["future"])
+                result = entry["future"].result()
                 waited_ms = (time.time() - t_wait) * 1000
                 pipeline_ok = "pipeline ok" if waited_ms < 50 else f"waited {waited_ms:.0f}ms"
                 check = get_response_result(result)
@@ -332,7 +332,7 @@ class AktoGuardrailsAddon:
                 print(f"[AKTO] STREAM   | error (fail open) | {e}")
             return entry["bytes"], None
 
-        async def stream_handler(chunk: bytes):
+        def stream_handler(chunk: bytes):
             is_end = not chunk
 
             if not is_end:
@@ -361,7 +361,7 @@ class AktoGuardrailsAddon:
 
             # Step 1: collect result from the previous batch's in-flight API call
             if state["inflight"]:
-                approved_bytes, block_reason = await _wait_inflight()
+                approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
                     print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
                     state["batch_bytes"] = b""
@@ -388,7 +388,7 @@ class AktoGuardrailsAddon:
 
             # Step 3: on stream end, drain the final in-flight batch
             if is_end and state["inflight"]:
-                approved_bytes, block_reason = await _wait_inflight()
+                approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
                     print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | BLOCKED | {block_reason}")
                     yield _block_event(block_reason)

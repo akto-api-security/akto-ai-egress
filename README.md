@@ -22,10 +22,10 @@ Every outbound request from an agent to an AI provider flows through the proxy:
 ### Streaming Architecture
 
 - Each agent's stream is fully isolated — no shared mutable state between concurrent agents.
-- A pipeline pattern fires the guardrail API call for batch N in the background while batch N+1 accumulates, minimising latency.
-- `asyncio.wrap_future` is used to await batch results without blocking the mitmproxy event loop, enabling true concurrency across multiple simultaneous agents.
+- A pipeline pattern fires the guardrail API call for batch N in the background while batch N+1 accumulates, so collection and accumulation overlap rather than stack.
 - Separate thread pools for hook-level checks and stream batch checks prevent streaming load from starving request guardrails.
 - A shared `requests.Session` reuses TCP connections to the Akto API across all agents.
+- Guardrail API calls for all agents are fired concurrently. Result collection is serialised through the mitmproxy event loop — if the Akto API responds within the batch accumulation window, collection is near-instant and agents are unaffected. If the Akto API is slower than that window, agents queue at the collection step.
 
 ### Supported Providers
 
@@ -67,7 +67,7 @@ The proxy supports up to **8 concurrent streaming agents** out of the box. Reque
 ## Proxy Features
 
 - **Chunk-by-chunk streaming guardrail** — LLM output is held from the agent, guardrailed in batches, and only forwarded once approved. Nothing reaches the agent before it is validated.
-- **Pipelined async checks** — while batch N is being evaluated by Akto, batch N+1 is already accumulating. The event loop is never blocked; all agents stream concurrently.
+- **Pipelined async checks** — while batch N is being evaluated by Akto, batch N+1 is already accumulating. Guardrail API calls across all agents fire concurrently in a background thread pool.
 - **Tool call interception** — tool names and tool input (streamed as JSON fragments) are extracted and guardrailed alongside text, catching malicious tool invocations and indirect prompt injection via fetched content.
 - **Graceful block responses** — blocked requests and responses are returned as valid LLM streaming messages containing the block reason, not HTTP errors. The agent handles them as normal responses.
 - **Multi-provider support** — works transparently with both Anthropic and OpenAI streaming APIs, auto-detecting the provider per request.
