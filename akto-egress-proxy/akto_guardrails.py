@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import json
 import os
+import struct
 import time
 import zlib
 
@@ -21,6 +23,7 @@ _session = requests.Session()                          # shared connection pool 
 AI_HOSTS = {
     "api.openai.com",
     "api.anthropic.com",
+    "bedrock-runtime.amazonaws.com",
 }
 
 _AGENTIC_TAG = json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"})
@@ -38,7 +41,13 @@ print(
 )
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
-    return flow.request.pretty_host in AI_HOSTS
+    host = flow.request.pretty_host
+    if host in AI_HOSTS:
+        return True
+    # Bedrock uses region-specific endpoints: bedrock-runtime.us-east-1.amazonaws.com
+    if host.startswith("bedrock-runtime.") and host.endswith(".amazonaws.com"):
+        return True
+    return False
 
 def _provider(flow: http.HTTPFlow) -> str:
     return "openai" if "openai" in flow.request.pretty_host else "anthropic"
@@ -104,7 +113,7 @@ def build_akto_payload(
 
 def _call_akto_sync(payload: dict, params: dict, label: str = "payload", timeout: int = 15) -> dict:
     if LOG_PAYLOADS:
-        print(f"[AKTO] {label} | {payload}")
+        print(f"[AKTO] request  | {label} | url={AKTO_URL} params={params} | body={json.dumps(payload)}")
     t0 = time.time()
     r = _session.get(
         AKTO_URL,
@@ -113,15 +122,14 @@ def _call_akto_sync(payload: dict, params: dict, label: str = "payload", timeout
         json=payload,
         timeout=timeout,
     )
-    r.raise_for_status()
-    result = r.json()
     latency_ms = (time.time() - t0) * 1000
     check_type = label.replace(" payload", "")
     if LOG_PAYLOADS:
-        print(f"[AKTO] response | {check_type} | latency={latency_ms:.0f}ms | {result}")
+        print(f"[AKTO] response | {check_type} | status={r.status_code} | latency={latency_ms:.0f}ms | body={r.text}")
     else:
-        print(f"[AKTO] response | {check_type} | latency={latency_ms:.0f}ms")
-    return result
+        print(f"[AKTO] response | {check_type} | status={r.status_code} | latency={latency_ms:.0f}ms")
+    r.raise_for_status()
+    return r.json()
 
 async def _call_akto(payload: dict, params: dict, label: str = "payload") -> dict:
     loop = asyncio.get_running_loop()
@@ -133,7 +141,8 @@ async def call_akto_request(flow: http.HTTPFlow) -> dict:
 
 def call_akto_response_stream(flow: http.HTTPFlow, text_chunk: str) -> dict:
     # sync — called from _stream_executor in the stream handler
-    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | {len(text_chunk)} chars | [{text_chunk}]")
+    if LOG_PAYLOADS:
+        print(f"[AKTO] GUARDRAIL | agent={_agent_id(flow)} | sending to Akto | {len(text_chunk)} chars | response=[{text_chunk}]")
     response_body = json.dumps({"content": [{"type": "text", "text": text_chunk}]})
     return _call_akto_sync(
         build_akto_payload(flow, response_body=response_body, status_code=str(flow.response.status_code)),
@@ -228,11 +237,89 @@ def extract_sse_events(raw: bytes) -> tuple:
 
     return complete_bytes, leftover, extracted_text
 
+def parse_event_stream_frames(buffer: bytes) -> tuple:
+    """
+    Parse AWS binary event stream frames from a buffer.
+    Frame layout:
+      [4B total_length][4B headers_length][4B prelude_CRC][headers][payload][4B message_CRC]
+    Returns: (list of payload bytes, leftover incomplete buffer)
+    """
+    payloads = []
+    offset = 0
+    while offset < len(buffer):
+        if offset + 12 > len(buffer):
+            break
+        total_length = struct.unpack_from(">I", buffer, offset)[0]
+        headers_length = struct.unpack_from(">I", buffer, offset + 4)[0]
+        if offset + total_length > len(buffer):
+            break
+        payload_offset = offset + 8 + 4 + headers_length
+        payload_length = total_length - 8 - 4 - headers_length - 4
+        if payload_length > 0:
+            payloads.append(buffer[payload_offset: payload_offset + payload_length])
+        offset += total_length
+    return payloads, buffer[offset:]
+
+def extract_bedrock_text(payload: bytes) -> str:
+    """
+    Extract text content from a single Bedrock event stream frame payload.
+    Handles: Claude via Bedrock, Converse API, Titan, Llama, Mistral, Cohere.
+    """
+    try:
+        obj = json.loads(payload)
+
+        # most Bedrock model-specific APIs wrap the delta in base64 "bytes"
+        if "bytes" in obj:
+            obj = json.loads(base64.b64decode(obj["bytes"]))
+
+        # Claude via Bedrock invoke-with-response-stream (Anthropic delta format)
+        delta = obj.get("delta", {})
+        if delta.get("type") == "text_delta":
+            return delta.get("text", "")
+        if delta.get("type") == "input_json_delta":
+            return delta.get("partial_json", "")
+
+        # Bedrock Converse API — delta has {"text": "..."} directly, no "type" field
+        if "text" in delta:
+            return delta["text"]
+
+        # Bedrock Converse API wrapper format
+        content_block_delta = obj.get("contentBlockDelta", {})
+        if content_block_delta:
+            return content_block_delta.get("delta", {}).get("text", "") or ""
+
+        # Amazon Titan
+        if "outputText" in obj:
+            return obj["outputText"]
+
+        # Meta Llama
+        if "generation" in obj:
+            return obj["generation"]
+
+        # Mistral
+        outputs = obj.get("outputs", [])
+        if outputs:
+            return outputs[0].get("text", "")
+
+        # Cohere
+        if obj.get("event_type") == "text-generation":
+            return obj.get("text", "")
+
+    except Exception:
+        pass
+    return ""
+
 class AktoGuardrailsAddon:
     def responseheaders(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
         content_type = flow.response.headers.get("content-type", "")
+
+        if "application/vnd.amazon.eventstream" in content_type:
+            flow.metadata["_akto_streaming"] = True
+            flow.response.stream = self._make_async_bedrock_stream_handler(flow)
+            return
+
         if "text/event-stream" not in content_type:
             return
         content_encoding = flow.response.headers.get("content-encoding", "").lower()
@@ -241,7 +328,87 @@ class AktoGuardrailsAddon:
         flow.metadata["_akto_gzip"] = is_gzip
         if is_gzip:
             del flow.response.headers["content-encoding"]
-        flow.response.stream = self._make_stream_handler(flow)
+        flow.response.stream = self._make_async_stream_handler(flow)
+
+    def _make_async_stream_handler(self, flow: http.HTTPFlow):
+        """
+        Zero-latency async tap: forward every chunk to the client immediately,
+        accumulate full response text, fire guardrail check once at stream end.
+        Result goes to Akto dashboard only — nothing is blocked on the client side.
+        """
+        state = {
+            "full_text": "",
+            "decode_buffer": b"",
+            "decompressor": (
+                zlib.decompressobj(16 + zlib.MAX_WBITS)
+                if flow.metadata.get("_akto_gzip")
+                else None
+            ),
+        }
+
+        def stream_handler(chunk: bytes):
+            is_end = not chunk
+
+            if not is_end:
+                if state["decompressor"]:
+                    try:
+                        decoded = state["decompressor"].decompress(chunk)
+                    except zlib.error as e:
+                        print(f"[AKTO] decompression error (using raw): {e}")
+                        decoded = chunk
+                else:
+                    decoded = chunk
+
+                state["decode_buffer"] += decoded
+                _, leftover, chunk_text = extract_sse_events(state["decode_buffer"])
+                state["decode_buffer"] = leftover
+                state["full_text"] += chunk_text
+
+                if chunk_text and LOG_PAYLOADS:
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | chunk | [{chunk_text}]")
+
+                yield decoded  # forward to client immediately, zero latency
+
+            if is_end and state["full_text"]:
+                text = state["full_text"]
+                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
+                _stream_executor.submit(call_akto_response_stream, flow, text)  # fire-and-forget
+
+        return stream_handler
+
+    def _make_async_bedrock_stream_handler(self, flow: http.HTTPFlow):
+        """
+        Zero-latency async tap for Bedrock's binary event stream (application/vnd.amazon.eventstream).
+        Forwards every frame to the client immediately, accumulates full response text,
+        fires guardrail check once at stream end — fire-and-forget, nothing blocked on client.
+        """
+        state = {
+            "full_text": "",
+            "frame_buffer": b"",
+        }
+
+        def stream_handler(chunk: bytes):
+            is_end = not chunk
+
+            if not is_end:
+                state["frame_buffer"] += chunk
+                payloads, state["frame_buffer"] = parse_event_stream_frames(state["frame_buffer"])
+
+                for payload in payloads:
+                    text = extract_bedrock_text(payload)
+                    if text:
+                        state["full_text"] += text
+                        if LOG_PAYLOADS:
+                            print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | chunk | [{text}]")
+
+                yield chunk  # forward to client immediately, zero latency
+
+            if is_end and state["full_text"]:
+                text = state["full_text"]
+                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
+                _stream_executor.submit(call_akto_response_stream, flow, text)  # fire-and-forget
+
+        return stream_handler
 
     def _make_stream_handler(self, flow: http.HTTPFlow):
         state = {

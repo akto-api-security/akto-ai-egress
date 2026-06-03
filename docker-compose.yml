@@ -27,24 +27,24 @@ services:
     networks:
       - akto-egress-net
 
-  anthropic-agent:
-    build:
-      context: ./agent
-      dockerfile: Dockerfile
-    image: anthropic-agent
-    container_name: anthropic-agent
-    depends_on:
-      - akto-egress-proxy
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      HTTP_PROXY: http://akto-egress-proxy:8087
-      HTTPS_PROXY: http://akto-egress-proxy:8087
-      SSL_CERT_FILE: /certs/mitmproxy-ca-cert.pem
-      REQUESTS_CA_BUNDLE: /certs/mitmproxy-ca-cert.pem
-    volumes:
-      - ./mitmproxy-data/mitmproxy-ca-cert.pem:/certs/mitmproxy-ca-cert.pem:ro
-    networks:
-      - akto-egress-net
+  # anthropic-agent:
+  #   build:
+  #     context: ./agent
+  #     dockerfile: Dockerfile
+  #   image: anthropic-agent
+  #   container_name: anthropic-agent
+  #   depends_on:
+  #     - akto-egress-proxy
+  #   environment:
+  #     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  #     HTTP_PROXY: http://akto-egress-proxy:8087
+  #     HTTPS_PROXY: http://akto-egress-proxy:8087
+  #     SSL_CERT_FILE: /certs/mitmproxy-ca-cert.pem
+  #     REQUESTS_CA_BUNDLE: /certs/mitmproxy-ca-cert.pem
+  #   volumes:
+  #     - ./mitmproxy-data/mitmproxy-ca-cert.pem:/certs/mitmproxy-ca-cert.pem:ro
+  #   networks:
+  #     - akto-egress-net
 
 networks:
   akto-egress-net:
