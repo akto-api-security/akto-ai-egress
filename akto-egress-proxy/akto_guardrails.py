@@ -16,6 +16,7 @@ APP_NAME = os.getenv("APP_NAME")
 
 TEXT_THRESHOLD  = int(os.getenv("AKTO_TEXT_THRESHOLD", "600"))
 LOG_PAYLOADS    = os.getenv("AKTO_LOG_PAYLOADS", "").lower() == "true"
+ASYNC_MODE      = os.getenv("AKTO_GUARDRAILS_MODE", "async").lower() != "sync"
 _hook_executor   = ThreadPoolExecutor(max_workers=4)   # request/response hook API calls
 _stream_executor = ThreadPoolExecutor(max_workers=8)   # stream batch API calls (1 per agent)
 _session = requests.Session()                          # shared connection pool to Akto
@@ -33,6 +34,7 @@ _RESPONSE_PARAMS = {"response_guardrails": "true", "ingest_data": "true"}
 print(
     f"[AKTO] starting"
     f" | url={AKTO_URL}"
+    f" | mode={'async' if ASYNC_MODE else 'sync'}"
     f" | threshold={TEXT_THRESHOLD} chars"
     f" | log_payloads={LOG_PAYLOADS}"
     f" | hook_workers={_hook_executor._max_workers}"
@@ -317,7 +319,10 @@ class AktoGuardrailsAddon:
 
         if "application/vnd.amazon.eventstream" in content_type:
             flow.metadata["_akto_streaming"] = True
-            flow.response.stream = self._make_async_bedrock_stream_handler(flow)
+            if ASYNC_MODE:
+                flow.response.stream = self._make_async_bedrock_stream_handler(flow)
+            else:
+                flow.response.stream = self._make_sync_bedrock_stream_handler(flow)
             return
 
         if "text/event-stream" not in content_type:
@@ -328,16 +333,19 @@ class AktoGuardrailsAddon:
         flow.metadata["_akto_gzip"] = is_gzip
         if is_gzip:
             del flow.response.headers["content-encoding"]
-        flow.response.stream = self._make_async_stream_handler(flow)
+        if ASYNC_MODE:
+            flow.response.stream = self._make_async_stream_handler(flow)
+        else:
+            flow.response.stream = self._make_stream_handler(flow)
 
     def _make_async_stream_handler(self, flow: http.HTTPFlow):
         """
-        Zero-latency async tap: forward every chunk to the client immediately,
-        accumulate full response text, fire guardrail check once at stream end.
-        Result goes to Akto dashboard only — nothing is blocked on the client side.
+        Zero-latency async tap (SSE): forward every chunk to the client immediately.
+        Accumulates text in batches (TEXT_THRESHOLD chars), fires each batch to Akto
+        as fire-and-forget. Client is never blocked regardless of guardrail result.
         """
         state = {
-            "full_text": "",
+            "batch_text": "",
             "decode_buffer": b"",
             "decompressor": (
                 zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -345,6 +353,10 @@ class AktoGuardrailsAddon:
                 else None
             ),
         }
+
+        def _fire(text: str):
+            print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
+            _stream_executor.submit(call_akto_response_stream, flow, text)
 
         def stream_handler(chunk: bytes):
             is_end = not chunk
@@ -362,30 +374,37 @@ class AktoGuardrailsAddon:
                 state["decode_buffer"] += decoded
                 _, leftover, chunk_text = extract_sse_events(state["decode_buffer"])
                 state["decode_buffer"] = leftover
-                state["full_text"] += chunk_text
+                state["batch_text"] += chunk_text
 
                 if chunk_text and LOG_PAYLOADS:
                     print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | chunk | [{chunk_text}]")
 
                 yield decoded  # forward to client immediately, zero latency
 
-            if is_end and state["full_text"]:
-                text = state["full_text"]
-                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
-                _stream_executor.submit(call_akto_response_stream, flow, text)  # fire-and-forget
+                if len(state["batch_text"]) >= TEXT_THRESHOLD:
+                    _fire(state["batch_text"])
+                    state["batch_text"] = ""
+
+            if is_end and state["batch_text"]:
+                _fire(state["batch_text"])
+                state["batch_text"] = ""
 
         return stream_handler
 
     def _make_async_bedrock_stream_handler(self, flow: http.HTTPFlow):
         """
-        Zero-latency async tap for Bedrock's binary event stream (application/vnd.amazon.eventstream).
-        Forwards every frame to the client immediately, accumulates full response text,
-        fires guardrail check once at stream end — fire-and-forget, nothing blocked on client.
+        Zero-latency async tap for Bedrock binary event stream (application/vnd.amazon.eventstream).
+        Forwards every frame to the client immediately, accumulates text in batches (TEXT_THRESHOLD),
+        fires each batch to Akto as fire-and-forget. Client is never blocked.
         """
         state = {
-            "full_text": "",
+            "batch_text": "",
             "frame_buffer": b"",
         }
+
+        def _fire(text: str):
+            print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
+            _stream_executor.submit(call_akto_response_stream, flow, text)
 
         def stream_handler(chunk: bytes):
             is_end = not chunk
@@ -397,16 +416,107 @@ class AktoGuardrailsAddon:
                 for payload in payloads:
                     text = extract_bedrock_text(payload)
                     if text:
-                        state["full_text"] += text
+                        state["batch_text"] += text
                         if LOG_PAYLOADS:
                             print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | chunk | [{text}]")
 
                 yield chunk  # forward to client immediately, zero latency
 
-            if is_end and state["full_text"]:
-                text = state["full_text"]
-                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing async guardrail | {len(text)} chars")
-                _stream_executor.submit(call_akto_response_stream, flow, text)  # fire-and-forget
+                if len(state["batch_text"]) >= TEXT_THRESHOLD:
+                    _fire(state["batch_text"])
+                    state["batch_text"] = ""
+
+            if is_end and state["batch_text"]:
+                _fire(state["batch_text"])
+                state["batch_text"] = ""
+
+        return stream_handler
+
+    def _make_sync_bedrock_stream_handler(self, flow: http.HTTPFlow):
+        """
+        Sync pipeline handler for Bedrock binary event stream.
+        Accumulates text in batches (TEXT_THRESHOLD), evaluates each batch through Akto.
+        Can block the client mid-stream if a batch is rejected.
+        """
+        state = {
+            "batch_bytes": b"",
+            "batch_text": "",
+            "frame_buffer": b"",
+            "inflight": None,
+        }
+
+        def _wait_inflight():
+            entry = state["inflight"]
+            state["inflight"] = None
+            t_wait = time.time()
+            try:
+                result = entry["future"].result()
+                waited_ms = (time.time() - t_wait) * 1000
+                pipeline_ok = "pipeline ok" if waited_ms < 50 else f"waited {waited_ms:.0f}ms"
+                check = get_response_result(result)
+                behaviour = (check.get("behaviour") or "").lower()
+                if behaviour == "block":
+                    reason = check.get("Reason") or "Blocked by Akto response guardrails"
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | decision=BLOCKED | {pipeline_ok} | {reason}")
+                    return b"", reason
+                if check.get("Allowed") is not True:
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | alert | {pipeline_ok} | {check.get('Reason', '')}")
+                else:
+                    print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | allowed | {pipeline_ok}")
+            except Exception as e:
+                print(f"[AKTO] STREAM   | error (fail open) | {e}")
+            return entry["bytes"], None
+
+        def stream_handler(chunk: bytes):
+            is_end = not chunk
+
+            if not is_end:
+                state["frame_buffer"] += chunk
+                payloads, state["frame_buffer"] = parse_event_stream_frames(state["frame_buffer"])
+                for payload in payloads:
+                    text = extract_bedrock_text(payload)
+                    if text:
+                        state["batch_text"] += text
+                        if LOG_PAYLOADS:
+                            print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | chunk | [{text}]")
+                state["batch_bytes"] += chunk
+
+            should_flush = (
+                len(state["batch_text"]) >= TEXT_THRESHOLD
+                or (is_end and (state["batch_bytes"] or state["inflight"]))
+            )
+
+            if not should_flush:
+                return
+
+            # Step 1: collect result from previous inflight batch
+            if state["inflight"]:
+                approved_bytes, block_reason = _wait_inflight()
+                if block_reason:
+                    state["batch_bytes"] = b""
+                    state["batch_text"] = ""
+                    return  # stop generator — mitmproxy closes connection
+                yield approved_bytes
+
+            # Step 2: fire current batch
+            if state["batch_text"]:
+                print(f"[AKTO] STREAM   | agent={_agent_id(flow)} | firing sync guardrail | {len(state['batch_text'])} chars")
+                state["inflight"] = {
+                    "future": _stream_executor.submit(call_akto_response_stream, flow, state["batch_text"]),
+                    "bytes": state["batch_bytes"],
+                }
+                state["batch_bytes"] = b""
+                state["batch_text"] = ""
+            elif state["batch_bytes"]:
+                yield state["batch_bytes"]
+                state["batch_bytes"] = b""
+
+            # Step 3: drain final inflight on stream end
+            if is_end and state["inflight"]:
+                approved_bytes, block_reason = _wait_inflight()
+                if block_reason:
+                    return  # stop generator — mitmproxy closes connection
+                yield approved_bytes
 
         return stream_handler
 
