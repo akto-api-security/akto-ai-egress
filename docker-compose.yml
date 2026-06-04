@@ -18,7 +18,7 @@ services:
       AKTO_URL: ${AKTO_URL}
       APP_NAME: ${APP_NAME:-}
       AKTO_TEXT_THRESHOLD: 600   # min accumulated chars in a streaming batch before sending to Akto for evaluation (default: 600)
-      AKTO_GUARDRAILS_MODE: async # sync: holds chunks until guardrail approves (can block mid-stream) | async: zero latency, guardrails fire-and-forget (default: sync)
+      AKTO_GUARDRAILS_MODE: sync # sync: holds chunks until guardrail approves (can block mid-stream) | async: zero latency, guardrails fire-and-forget (default: sync)
       AKTO_LOG_PAYLOADS: true   # log full request/response payloads for debugging (default: false)
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy

@@ -262,6 +262,32 @@ def parse_event_stream_frames(buffer: bytes) -> tuple:
         offset += total_length
     return payloads, buffer[offset:]
 
+def _encode_string_header(name: bytes, value: bytes) -> bytes:
+    return bytes([len(name)]) + name + b"\x07" + len(value).to_bytes(2, "big") + value
+
+def _make_bedrock_error_frame(reason: str) -> bytes:
+    """
+    Build an AWS binary event stream error frame.
+    boto3 EventStream uses :message-type=error with :error-code and
+    :error-message as direct headers — this surfaces as:
+      An error occurred (GuardrailsBlocked) when calling the ConverseStream
+      operation: <reason>
+    Frame: [4B total][4B headers_len][4B prelude_CRC][headers][payload][4B msg_CRC]
+    """
+    headers = (
+        _encode_string_header(b":message-type", b"error") +
+        _encode_string_header(b":error-code", b"GuardrailsBlocked") +
+        _encode_string_header(b":error-message", reason.encode())
+    )
+    payload = b""
+    headers_len = len(headers)
+    total_len = 4 + 4 + 4 + headers_len + len(payload) + 4
+    prelude = struct.pack(">II", total_len, headers_len)
+    prelude_crc = zlib.crc32(prelude) & 0xFFFFFFFF
+    body = prelude + struct.pack(">I", prelude_crc) + headers + payload
+    msg_crc = zlib.crc32(body) & 0xFFFFFFFF
+    return body + struct.pack(">I", msg_crc)
+
 def extract_bedrock_text(payload: bytes) -> str:
     """
     Extract text content from a single Bedrock event stream frame payload.
@@ -495,7 +521,8 @@ class AktoGuardrailsAddon:
                 if block_reason:
                     state["batch_bytes"] = b""
                     state["batch_text"] = ""
-                    return  # stop generator — mitmproxy closes connection
+                    yield _make_bedrock_error_frame(block_reason)
+                    return
                 yield approved_bytes
 
             # Step 2: fire current batch
@@ -515,7 +542,8 @@ class AktoGuardrailsAddon:
             if is_end and state["inflight"]:
                 approved_bytes, block_reason = _wait_inflight()
                 if block_reason:
-                    return  # stop generator — mitmproxy closes connection
+                    yield _make_bedrock_error_frame(block_reason)
+                    return
                 yield approved_bytes
 
         return stream_handler
@@ -535,7 +563,14 @@ class AktoGuardrailsAddon:
         }
 
         def _block_event(reason: str) -> bytes:
-            return f'data: {json.dumps({"error": reason})}\n\ndata: [DONE]\n\n'.encode()
+            host = flow.request.pretty_host
+            if "anthropic.com" in host:
+                # Anthropic SSE error event — SDK raises APIStatusError with the message
+                payload = json.dumps({"type": "error", "error": {"type": "guardrails_blocked", "message": reason}})
+                return f"event: error\ndata: {payload}\n\n".encode()
+            # OpenAI-compatible SSE error
+            payload = json.dumps({"error": {"message": reason, "type": "guardrails_blocked"}})
+            return f"data: {payload}\n\ndata: [DONE]\n\n".encode()
 
         def _wait_inflight():
             """Wait for the in-flight API result. Returns (approved_bytes, block_reason)."""
