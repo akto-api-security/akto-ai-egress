@@ -19,6 +19,7 @@ services:
     environment:
       AKTO_URL: ${AKTO_URL}
       APP_NAME: ${APP_NAME:-}
+      AI_HOSTS: ${AI_HOSTS:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
       - ./akto-egress-proxy:/addons:ro
@@ -37,5 +38,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       HTTP_PROXY: http://akto-egress-proxy:8087
       HTTPS_PROXY: http://akto-egress-proxy:8087
+      # Python clients ignore the OS store by default; point them at the bundle
+      # update-ca-certificates builds (system CAs + mitmproxy CA).
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      AWS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
     volumes:
       - ./mitmproxy-data/mitmproxy-ca-cert.pem:/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt:ro
