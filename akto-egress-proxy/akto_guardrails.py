@@ -1,7 +1,8 @@
 import json
+import re
 import time
 import requests
-from mitmproxy import http
+from mitmproxy import ctx, http
 
 import os
 
@@ -9,15 +10,26 @@ AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") el
 AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
 
-AI_HOSTS = {
+# Comma-separated hostnames; "*" matches any run of characters.
+DEFAULT_AI_HOSTS = ",".join([
     "api.openai.com",
     "api.anthropic.com",
-}
+    "chatgpt.com",
+    "bedrock-runtime.*.amazonaws.com",
+    "bedrock-agent-runtime.*.amazonaws.com",
+])
+AI_HOSTS = [h.strip().lower() for h in (os.getenv("AI_HOSTS") or DEFAULT_AI_HOSTS).split(",") if h.strip()]
+
+AI_HOSTS_PATTERN = "|".join(re.escape(h).replace(r"\*", r"[^:]*") for h in AI_HOSTS)
+AI_HOSTS_RE = re.compile(rf"^(?:{AI_HOSTS_PATTERN})$", re.IGNORECASE)
+# mitmproxy matches allow_hosts against "host:port", not the bare hostname.
+ALLOW_HOSTS_REGEX = rf"^(?:{AI_HOSTS_PATTERN}):\d+$"
 
 print(f"[AKTO] URL: {AKTO_URL}")
+print(f"[AKTO] AI hosts: {AI_HOSTS}")
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
-    return flow.request.pretty_host in AI_HOSTS
+    return bool(AI_HOSTS_RE.match(flow.request.pretty_host))
 
 
 def safe_headers(headers) -> str:
@@ -142,6 +154,15 @@ def block_response(reason: str, metadata=None, status_code: int = 403):
 
 
 class AktoGuardrailsAddon:
+    def load(self, loader):
+        # Only decrypt TLS to AI hosts; everything else is tunnelled untouched.
+        # An explicit --allow-hosts on the command line wins; --ignore-hosts is
+        # applied on top of this to carve out exceptions.
+        if not ctx.options.allow_hosts:
+            ctx.options.allow_hosts = [ALLOW_HOSTS_REGEX]
+        print(f"[AKTO] allow_hosts: {ctx.options.allow_hosts}")
+        print(f"[AKTO] ignore_hosts: {ctx.options.ignore_hosts}")
+
     def request(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
