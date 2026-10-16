@@ -1,9 +1,6 @@
 services:
   akto-egress-proxy:
-    build:
-      context: ./akto-egress-proxy
-      dockerfile: Dockerfile
-    image: akto-egress-proxy
+    image: public.ecr.aws/aktosecurity/akto-egress-proxy:latest
     container_name: akto-egress-proxy
     command:
     - mitmdump
@@ -22,7 +19,6 @@ services:
       AI_HOSTS: ${AI_HOSTS:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
-      - ./akto-egress-proxy:/addons:ro
     expose:
       - "8087"
 
