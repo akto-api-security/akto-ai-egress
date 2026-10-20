@@ -70,7 +70,7 @@ def build_akto_payload(
         "method": flow.request.method,
         "requestPayload": extract_messages(flow),
         "responsePayload": response_body,
-        "ip": flow.client_conn.peername[0] if flow.client_conn.peername else "127.0.0.1",
+        "ip": flow.metadata.get("akto_client_ip") or (flow.client_conn.peername[0] if flow.client_conn.peername else "127.0.0.1"),
         "destIp": flow.server_conn.ip_address[0] if flow.server_conn.ip_address else "127.0.0.1",
         "time": str(int(time.time() * 1000)),
         "statusCode": str(status_code),
@@ -166,6 +166,13 @@ class AktoGuardrailsAddon:
     def request(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
+
+        # The agent passes its caller's IP in X-Forwarded-For; keep the first
+        # (originating) entry for Akto and strip it so it never reaches the LLM.
+        forwarded_for = flow.request.headers.pop("X-Forwarded-For", "")
+        client_ip = forwarded_for.split(",")[0].strip()
+        if client_ip:
+            flow.metadata["akto_client_ip"] = client_ip
 
         try:
             result = call_akto_request(flow)
