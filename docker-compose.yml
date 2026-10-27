@@ -16,6 +16,7 @@ services:
     environment:
       AKTO_URL: ${AKTO_URL}
       APP_NAME: ${APP_NAME:-}
+      AKTO_TOKEN: ${AKTO_TOKEN:-}
       AI_HOSTS: ${AI_HOSTS:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy

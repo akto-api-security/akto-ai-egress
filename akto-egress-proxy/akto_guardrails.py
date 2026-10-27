@@ -9,6 +9,8 @@ import os
 AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
 AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
+# Bare JWT (no "Bearer " prefix) — required when data-ingestion runs with authentication on.
+AKTO_TOKEN = os.getenv("AKTO_TOKEN")
 
 # Comma-separated hostnames; "*" matches any run of characters.
 DEFAULT_AI_HOSTS = ",".join([
@@ -77,7 +79,7 @@ def build_akto_payload(
         "type": None,
         "status": str(status_code),
         "akto_account_id": "1000000",
-        "akto_vxlan_id": "test",
+        "akto_vxlan_id": "0",
         "is_pending": "false",
         "source": "MIRRORING",
         "direction": None,
@@ -93,34 +95,33 @@ def build_akto_payload(
     return xx
 
 
-def call_akto_request(flow: http.HTTPFlow) -> dict:
-    print ("evaluating request: ")
-    r = requests.get(
-        AKTO_URL,
-        params={"guardrails": "true", "ingest_data": "true"},
-        headers={"Content-Type": "application/json"},
-        json=build_akto_payload(flow),
-        timeout=15,
-    )
+def post_to_akto(params: dict, payload: dict) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if AKTO_TOKEN:
+        headers["Authorization"] = AKTO_TOKEN
+    r = requests.post(AKTO_URL, params=params, headers=headers, json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
+
+
+def call_akto_request(flow: http.HTTPFlow) -> dict:
+    print ("evaluating request: ")
+    return post_to_akto(
+        {"guardrails": "true", "ingest_data": "true"},
+        build_akto_payload(flow),
+    )
 
 
 def call_akto_response(flow: http.HTTPFlow) -> dict:
     print("evaluating response: ")
-    r = requests.get(
-        AKTO_URL,
-        params={"response_guardrails": "true", "ingest_data": "true"},
-        headers={"Content-Type": "application/json"},
-        json=build_akto_payload(
+    return post_to_akto(
+        {"response_guardrails": "true", "ingest_data": "true"},
+        build_akto_payload(
             flow,
             response_body=flow.response.get_text(strict=False) or "",
             status_code=str(flow.response.status_code),
         ),
-        timeout=15,
     )
-    r.raise_for_status()
-    return r.json()
 
 
 def get_request_result(result: dict) -> dict:
@@ -194,7 +195,9 @@ class AktoGuardrailsAddon:
                 flow.request.set_text(modified_payload)
 
         except Exception as e:
-            return   
+            print(f"[AKTO] request guardrails call failed, allowing request: {e}")
+            return
+
     def response(self, flow: http.HTTPFlow):
         if not is_ai_provider(flow):
             return
@@ -224,6 +227,7 @@ class AktoGuardrailsAddon:
                 flow.response.set_text(modified_payload)
 
         except Exception as e:
+            print(f"[AKTO] response guardrails call failed, allowing response: {e}")
             return
 
 
