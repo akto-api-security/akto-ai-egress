@@ -22,13 +22,26 @@ DEFAULT_AI_HOSTS = ",".join([
 ])
 AI_HOSTS = [h.strip().lower() for h in (os.getenv("AI_HOSTS") or DEFAULT_AI_HOSTS).split(",") if h.strip()]
 
-AI_HOSTS_PATTERN = "|".join(re.escape(h).replace(r"\*", r"[^:]*") for h in AI_HOSTS)
+# Comma-separated key=value pairs added to the tag sent to Akto, e.g. "env=prod,team=payments".
+# The default gen-ai/source tags always win so Akto keeps classifying the traffic as agentic.
+DEFAULT_TAGS = {"gen-ai": "Gen AI", "source": "AGENTIC"}
+CUSTOM_TAGS = {}
+for pair in (os.getenv("AKTO_TAGS") or "").split(","):
+    key, sep, value = pair.partition("=")
+    if sep and key.strip():
+        CUSTOM_TAGS[key.strip()] = value.strip()
+    elif pair.strip():
+        print(f"[AKTO] ignoring malformed AKTO_TAGS entry: {pair.strip()!r}")
+TAGS = json.dumps({**CUSTOM_TAGS, **DEFAULT_TAGS})
+
+AI_HOSTS_PATTERN ="|".join(re.escape(h).replace(r"\*", r"[^:]*") for h in AI_HOSTS)
 AI_HOSTS_RE = re.compile(rf"^(?:{AI_HOSTS_PATTERN})$", re.IGNORECASE)
 # mitmproxy matches allow_hosts against "host:port", not the bare hostname.
 ALLOW_HOSTS_REGEX = rf"^(?:{AI_HOSTS_PATTERN}):\d+$"
 
 print(f"[AKTO] URL: {AKTO_URL}")
 print(f"[AKTO] AI hosts: {AI_HOSTS}")
+print(f"[AKTO] tags: {TAGS}")
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return bool(AI_HOSTS_RE.match(flow.request.pretty_host))
@@ -87,7 +100,7 @@ def build_akto_payload(
         "socket_id": None,
         "daemonset_id": None,
         "enabled_graph": None,
-        "tag": json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"}),
+        "tag": TAGS,
         "metadata": json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"}),
         "contextSource": "AGENTIC",
     }
