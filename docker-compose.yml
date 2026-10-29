@@ -18,6 +18,7 @@ services:
       APP_NAME: ${APP_NAME:-}
       AKTO_TOKEN: ${AKTO_TOKEN:-}
       AI_HOSTS: ${AI_HOSTS:-}
+      AKTO_TAGS: ${AKTO_TAGS:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
     expose:

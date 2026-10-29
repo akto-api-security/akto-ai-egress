@@ -5,6 +5,7 @@ export ANTHROPIC_API_KEY=sk-ant-....
 export AKTO_URL=...
 export APP_NAME=...        # identifies your app in Akto guardrails (sent as the host header)
 export AKTO_TOKEN=...      # needed when data-ingestion runs with authentication on
+export AKTO_TAGS=env=prod,team=payments   # optional extra tags sent to Akto
 docker compose up --build
 ```
 
@@ -17,6 +18,7 @@ docker compose up --build
 | `APP_NAME` | Yes | Name of your application. When set, it is sent as the `host` header in requests to Akto so you can identify traffic per app. |
 | `AKTO_TOKEN` | When data-ingestion authentication is on | Data-ingestion token (the account's database-abstractor JWT). Sent as a bare JWT in the `Authorization` header, with no `Bearer ` prefix. |
 | `AI_HOSTS` | No | Comma-separated hosts to intercept and run guardrails on; `*` matches any run of characters. Defaults to `api.openai.com,api.anthropic.com,chatgpt.com,bedrock-runtime.*.amazonaws.com,bedrock-agent-runtime.*.amazonaws.com`. All other traffic is tunnelled without inspection. |
+| `AKTO_TAGS` | No | Comma-separated `key=value` pairs added to the `tag` sent to Akto (e.g. `env=prod,team=payments`). The built-in `gen-ai` and `source` tags are always sent and cannot be overridden. |
 
 To add a provider, add it to `AI_HOSTS` and to the `--ignore-hosts` regex in `docker-compose.yml`. A host is intercepted only if it is in both.
 
