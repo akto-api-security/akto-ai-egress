@@ -73,6 +73,24 @@ def extract_messages(flow: http.HTTPFlow) -> str:
     except Exception:
         return ""
 
+def apply_masked_request(flow: http.HTTPFlow, modified_payload: str) -> None:
+    # Akto masks the payload extract_messages sent ({"messages": ...} or {"raw": ...}), not the
+    # provider body. Put the masked messages back into the original body so provider fields
+    # such as model and max_tokens survive; replacing the whole body would drop them.
+    try:
+        masked = json.loads(modified_payload)
+        if "messages" in masked:
+            body = json.loads(flow.request.get_text(strict=False) or "")
+            body["messages"] = masked["messages"]
+            flow.request.set_text(json.dumps(body))
+            return
+        if "raw" in masked:
+            flow.request.set_text(json.dumps(masked["raw"]))
+            return
+    except Exception as e:
+        print(f"[AKTO] could not merge masked request into body, replacing it: {e}")
+    flow.request.set_text(modified_payload)
+
 def build_akto_payload(
     flow: http.HTTPFlow,
     response_body: str = "",
@@ -205,7 +223,7 @@ class AktoGuardrailsAddon:
                 return
 
             if modified and modified_payload:
-                flow.request.set_text(modified_payload)
+                apply_masked_request(flow, modified_payload)
 
         except Exception as e:
             print(f"[AKTO] request guardrails call failed, allowing request: {e}")
