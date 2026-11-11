@@ -19,6 +19,8 @@ services:
       AKTO_TOKEN: ${AKTO_TOKEN:-}
       AI_HOSTS: ${AI_HOSTS:-}
       AKTO_TAGS: ${AKTO_TAGS:-}
+      AKTO_STREAM_GUARDRAILS: ${AKTO_STREAM_GUARDRAILS:-}
+      AKTO_STREAM_CHUNK_CHARS: ${AKTO_STREAM_CHUNK_CHARS:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
     expose:
