@@ -19,6 +19,8 @@ docker compose up --build
 | `AKTO_TOKEN` | When data-ingestion authentication is on | Data-ingestion token (the account's database-abstractor JWT). Sent as a bare JWT in the `Authorization` header, with no `Bearer ` prefix. |
 | `AI_HOSTS` | No | Comma-separated hosts to intercept and run guardrails on; `*` matches any run of characters. Defaults to `api.openai.com,api.anthropic.com,chatgpt.com,bedrock-runtime.*.amazonaws.com,bedrock-agent-runtime.*.amazonaws.com`. All other traffic is tunnelled without inspection. |
 | `AKTO_TAGS` | No | Comma-separated `key=value` pairs added to the `tag` sent to Akto (e.g. `env=prod,team=payments`). The built-in `gen-ai` and `source` tags are always sent and cannot be overridden. |
+| `AKTO_STREAM_GUARDRAILS` | No | Streamed answers (Anthropic Messages, OpenAI Chat Completions and Responses) are checked in pieces as they arrive, and each piece is forwarded once it passes. A blocked piece ends the stream with the provider's own error event. On by default; `false` holds the whole stream and checks it once at the end, as before. |
+| `AKTO_STREAM_CHUNK_CHARS` | No | Characters of model text per check on a streamed answer (default `300`). Smaller pieces start flowing sooner but make more guardrail calls. |
 
 To add a provider, add it to `AI_HOSTS` and to the `--ignore-hosts` regex in `docker-compose.yml`. A host is intercepted only if it is in both.
 
